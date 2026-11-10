@@ -129,7 +129,7 @@ test('githubWaitMergeable: mergeable 异步计算，轮询到确定值（null �
   const orig = globalThis.fetch
   const mk = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) })
   let n = 0
-  globalThis.fetch = async () => { n++; return n < 3 ? mk({ mergeable: null }) : mk({ mergeable: true }) }
+  globalThis.fetch = async () => { n++; return n < 3 ? mk({ mergeable: null, mergeable_state: 'unknown' }) : mk({ mergeable: true, mergeable_state: 'clean' }) }
   try {
     const r = await I.githubWaitMergeable('tok', 'o', 'r', 1, { tries: 5, delayMs: 1 })
     assert.equal(r.mergeable, true)
@@ -137,11 +137,28 @@ test('githubWaitMergeable: mergeable 异步计算，轮询到确定值（null �
     assert.ok(n >= 3, '必须轮询到非 null 才返回')
   } finally { globalThis.fetch = orig }
 
-  globalThis.fetch = async () => mk({ mergeable: false })
+  globalThis.fetch = async () => mk({ mergeable: false, mergeable_state: 'dirty' })
   try {
     const r2 = await I.githubWaitMergeable('tok', 'o', 'r', 2, { tries: 3, delayMs: 1 })
     assert.equal(r2.mergeable, false)
     assert.equal(r2.conflict, true)
+  } finally { globalThis.fetch = orig }
+})
+
+test('githubWaitMergeable: mergeable=false 但 state=unknown 时继续轮询，不误判冲突', async () => {
+  const orig = globalThis.fetch
+  const mk = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) })
+  const seq = [
+    { mergeable: false, mergeable_state: 'unknown' },
+    { mergeable: false, mergeable_state: 'unknown' },
+    { mergeable: true, mergeable_state: 'clean' },
+  ]
+  let i = 0
+  globalThis.fetch = async () => mk(seq[Math.min(i++, seq.length - 1)])
+  try {
+    const r = await I.githubWaitMergeable('tok', 'o', 'r', 3, { tries: 5, delayMs: 1 })
+    assert.equal(r.mergeable, true, '计算中的 false 不能当冲突')
+    assert.equal(r.conflict, false)
   } finally { globalThis.fetch = orig }
 })
 

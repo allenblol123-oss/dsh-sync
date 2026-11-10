@@ -757,14 +757,17 @@ async function githubMergePullRequest(token, owner, repo, number, method) {
 }
 
 /** GitHub 创建 PR 后 mergeable 由后台异步计算，首次读取常为 null；
- *  轮询到非 null 为止（默认 6 次 × 800ms）。超时按"未知"返回，上层保守地
- *  不合并（保留 PR + 分支，等下一轮或人工处理），避免把可合并 PR 误判成冲突。 */
-async function githubWaitMergeable(token, owner, repo, number, { tries = 6, delayMs = 800 } = {}) {
+ *  轮询到非 null 为止。注意 mergeable=false 也可能是「还在计算」或受保护分支：
+ *  GitHub 此时 mergeable_state 为 unknown/blocked，若直接判冲突，会把可合并 PR
+ *  误判成冲突（真机实证）。只有状态明确为 dirty 才判冲突，其余继续轮询。 */
+async function githubWaitMergeable(token, owner, repo, number, { tries = 12, delayMs = 1000 } = {}) {
   for (let i = 0; i < tries; i++) {
     const det = await githubGetPullRequest(token, owner, repo, number).catch(() => null)
     if (det && det.ok && det.json) {
-      if (det.json.mergeable === true) return { mergeable: true, conflict: false, json: det.json }
-      if (det.json.mergeable === false) return { mergeable: false, conflict: true, json: det.json }
+      const mergeable = det.json.mergeable
+      const state = det.json.mergeable_state
+      if (mergeable === true) return { mergeable: true, conflict: false, json: det.json }
+      if (mergeable === false && state === 'dirty') return { mergeable: false, conflict: true, json: det.json }
     }
     await new Promise((r) => setTimeout(r, delayMs))
   }
