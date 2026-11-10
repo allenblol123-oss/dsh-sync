@@ -163,7 +163,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 5. 合并成功后复用 `git push <remote> --delete <branch>` 清远端 sync 分支；
 6. **AI 冲突处理支持 GitHub**：`conflict/run` 与 `finalizeConflictBranch` 改为 provider-aware（GitCode/GitHub）；`conflictMode=ai` 时同步检测到冲突 PR 会自动触发一次处理（同一 PR 只跑一次 + 30 分钟冷却，避免每轮烧模型调用）；
 7. **会话日志 `.jsonl.zstd` 无损自动合并**：冲突时先逐帧解压 → 按 `seq` 取并集（同 seq 取 `time` 较新的一行）→ 逐行重新分帧压缩；会话文件不进 AI、不丢事件，剩余文本冲突（settings/技能/插件清单）才交给 agent；
-8. 测试：`test/providers.test.mjs` 新增 GitHub PR、mergeable 轮询、通道选择、zstd 合并等 5 组用例；全量 94 项离线测试通过；真实私有仓库跑通「推送 → PR → mergeable → squash 合并 → 删分支」。
+8. 测试：`test/providers.test.mjs` 新增 GitHub PR、mergeable 轮询、通道选择、zstd 合并等 5 组用例；`test/conflict-zstd.test.mjs` 用真实 git 仓库验证「会话日志冲突 → 自动无损合并 → merge 提交」；全量 95 项离线测试通过；真实私有仓库跑通「推送 → PR → mergeable → squash 合并 → 删分支」。
 
 ## 更新日志（0.4.3 → 0.4.10）
 
