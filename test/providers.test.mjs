@@ -1,6 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const require = createRequire(import.meta.url)
 const I = require('../src/index.js').__internals
@@ -190,4 +193,52 @@ test('isSessionLogPath: 只匹配 session 日志，普通文本/其他二进制�
   assert.equal(I.isSessionLogPath('skills/dsh/foo/SKILL.md'), false)
   assert.equal(I.isSessionLogPath('plugins/desktop/package.json'), false)
   assert.equal(I.isSessionLogPath(''), false)
+})
+
+// ── fork 增强：包名变更后 profile patch 的自愈 ──
+
+test('healProfilePatchName: 旧包名就地改写，其余内容与 !!js 表达式不动', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-heal-'))
+  try {
+    const p = join(dir, 'cordis.patch.yml')
+    const before = [
+      '# comment',
+      '- id: ui-chat',
+      '  name: "@deepseek-ai/dsh-client-ui-chat"',
+      '  config:',
+      '    disabled: !!js "!ctx.get(\'x\')"',
+      '- id: dsh-sync',
+      '  name: "@weibaohui/dsh-sync"',
+      '  config:',
+      '    sync:',
+      '      repoUrl: https://github.com/o/r.git',
+      '',
+    ].join('\n')
+    writeFileSync(p, before)
+    const r = I.healProfilePatchName(p, '@allenblol123-oss/dsh-sync')
+    assert.equal(r.changed, true)
+    assert.equal(r.from, '@weibaohui/dsh-sync')
+    assert.equal(r.to, '@allenblol123-oss/dsh-sync')
+    const after = readFileSync(p, 'utf8')
+    assert.ok(after.includes('name: "@allenblol123-oss/dsh-sync"'))
+    assert.ok(after.includes('!!js "!ctx.get(\'x\')"'), '其它行的 !!js 表达式必须原样保留')
+    assert.ok(after.includes('repoUrl: https://github.com/o/r.git'), '配置内容不能动')
+    // 幂等：已经是当前包名时不再改写
+    assert.equal(I.healProfilePatchName(p, '@allenblol123-oss/dsh-sync').changed, false)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('healProfilePatchName: 没有 dsh-sync 行 / 没有 name 行时不乱改', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-heal-'))
+  try {
+    const p = join(dir, 'cordis.patch.yml')
+    writeFileSync(p, '- id: other\n  name: "@x/y"\n')
+    assert.equal(I.healProfilePatchName(p, '@a/b').reason, 'no-row')
+    writeFileSync(p, '- id: dsh-sync\n  config: {}\n')
+    assert.equal(I.healProfilePatchName(p, '@a/b').reason, 'no-name')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('PACKAGE_NAME: 指向当前包（fork 名）', () => {
+  assert.equal(I.PACKAGE_NAME, '@allenblol123-oss/dsh-sync')
 })

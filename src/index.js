@@ -42,6 +42,16 @@ const { join, relative, resolve, sep } = require('node:path')
 const { homedir, hostname } = require('node:os')
 const { createWebdavClient } = require('./webdav.js')
 const { localMirrorSwap } = require('./backup.js')
+
+// 当前包名（fork / 重命名后的真实名字）。用于启动自愈：profile patch（cordis.patch.yml）
+// 里保存的 `- id: dsh-sync` 行若仍指向旧包名，宿主无法把保存的配置映射到本插件，
+// 表现为"插件配置丢失/界面变空"。检测到不一致时就地改写为当前包名。
+const PACKAGE_NAME = (() => {
+  try {
+    const p = require('../package.json')
+    return (p && typeof p.name === 'string') ? p.name : ''
+  } catch { return '' }
+})()
 // settings 服务要求 schemastery schema（可调用 + toJSON；zod 不兼容，register 会抛错被吞）。
 // 宿主沙箱内解析打包依赖可能抛 ERR_INTERNAL_ASSERTION（.pnpm 软链），因此按候选次序
 // 找一个真正可用的副本：插件自身依赖 → dsh 全局安装 → 宿主进程里已加载的副本 →
@@ -158,6 +168,43 @@ function parseClearedKeys(raw) {
     const list = parsed && Array.isArray(parsed.cleared) ? parsed.cleared : []
     return list.filter((k) => typeof k === 'string' && Object.prototype.hasOwnProperty.call(DEFAULT_SYNC_SETTINGS, k))
   } catch { return [] }
+}
+
+/** 启动自愈：profile patch（cordis.patch.yml）里 `- id: dsh-sync` 行的 `name:`
+ *  若与当前包名不一致（fork 改名/迁移后常见），宿主映射不到保存的配置，界面会
+ *  显示成空配置。这里做最小化文本改写：只动该行的 name 值，保持其余内容、
+ *  注释与 `!!js` 表达式原样。返回 { changed, from, to, reason }。 */
+function healProfilePatchName(patchPath, expectedName) {
+  if (!patchPath || !expectedName) return { changed: false, reason: 'no-path' }
+  let text
+  try { text = fsSync.readFileSync(patchPath, 'utf8') } catch { return { changed: false, reason: 'unreadable' } }
+  const lines = text.split(/\r?\n/)
+  let idIdx = -1
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim()
+    if (!t.startsWith('-')) continue
+    const m = t.match(/^-[ \t]*id:[ \t]*(['"]?)([^'"]+)\1[ \t]*$/)
+    if (m && m[2] === 'dsh-sync') { idIdx = i; break }
+  }
+  if (idIdx < 0) return { changed: false, reason: 'no-row' }
+  let nameIdx = -1
+  for (let i = idIdx + 1; i < lines.length; i++) {
+    const t = lines[i].trim()
+    if (t.startsWith('-') && /id:/.test(t)) break // 下一个 patch 条目
+    if (/^name:/.test(t)) { nameIdx = i; break }
+  }
+  if (nameIdx < 0) return { changed: false, reason: 'no-name' }
+  const cur = lines[nameIdx].match(/^(\s*name:[ \t]*)(['"]?)([^'"]*)\2[ \t]*$/)
+  if (!cur) return { changed: false, reason: 'unparsed' }
+  const from = cur[3]
+  if (from === expectedName) return { changed: false, reason: 'ok' }
+  lines[nameIdx] = `${cur[1]}"${expectedName}"`
+  try {
+    const tmp = patchPath + '.heal-' + process.pid
+    fsSync.writeFileSync(tmp, lines.join('\n'), 'utf8')
+    fsSync.renameSync(tmp, patchPath)
+  } catch { return { changed: false, reason: 'write-failed' } }
+  return { changed: true, from, to: expectedName }
 }
 
 // 文件层与宿主文档层的取舍：默认取文件层（这正是「宿主写回失败时保存仍能跨重启生效」
@@ -2305,7 +2352,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config: Config ?? undefined,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, prChannelFor, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, githubRequest, githubCreatePullRequest, githubGetPullRequest, githubMergePullRequest, githubWaitMergeable, GITHUB_API_BASE, mergeSessionZstdBuffers, decompressZstdFrames, compressJsonlToZstdFrames, isSessionLogPath, resolveSessionLogConflicts, gitShowStageBuf, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, prChannelFor, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, githubRequest, githubCreatePullRequest, githubGetPullRequest, githubMergePullRequest, githubWaitMergeable, GITHUB_API_BASE, PACKAGE_NAME, healProfilePatchName, mergeSessionZstdBuffers, decompressZstdFrames, compressJsonlToZstdFrames, isSessionLogPath, resolveSessionLogConflicts, gitShowStageBuf, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
@@ -2414,6 +2461,14 @@ module.exports = {
       if (attempt < 15) setTimeout(() => { refreshLive(attempt + 1) }, 2000).unref?.()
     }
     refreshLive()
+    // 启动自愈：包名变更后 profile patch 里保存的 dsh-sync 行可能仍指向旧包名，
+    // 宿主映射不到会表现为"插件配置丢失/界面空白"。发现不一致就地改写。
+    try {
+      const healed = healProfilePatchName((ctx.settings && ctx.settings.documentPath) || '', PACKAGE_NAME)
+      if (healed.changed) {
+        try { ctx.logger.warn(`dsh-sync: 已修正 profile patch 中 dsh-sync 的包名 ${healed.from} → ${healed.to}（重启宿主后界面即可看到原配置）`) } catch {}
+      }
+    } catch {}
     // 优先级：默认值 < config.sync < 宿主文档 < 自持 settings.json < 本次运行内存覆写。
     // 自持文件排在宿主文档之上，是为了在「宿主 settings 写回失败」（本 bug）时保存的
     // 值仍能跨重启生效；一旦宿主通道被证实更新（见 hostDocumentMtime），文件层让位。
