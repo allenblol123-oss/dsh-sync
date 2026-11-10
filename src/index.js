@@ -760,7 +760,7 @@ async function githubMergePullRequest(token, owner, repo, number, method) {
  *  轮询到非 null 为止。注意 mergeable=false 也可能是「还在计算」或受保护分支：
  *  GitHub 此时 mergeable_state 为 unknown/blocked，若直接判冲突，会把可合并 PR
  *  误判成冲突（真机实证）。只有状态明确为 dirty 才判冲突，其余继续轮询。 */
-async function githubWaitMergeable(token, owner, repo, number, { tries = 12, delayMs = 1000 } = {}) {
+async function githubWaitMergeable(token, owner, repo, number, { tries = 30, delayMs = 2000 } = {}) {
   for (let i = 0; i < tries; i++) {
     const det = await githubGetPullRequest(token, owner, repo, number).catch(() => null)
     if (det && det.ok && det.json) {
@@ -1081,6 +1081,11 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
       state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
       advancedToMain = true
       return { pushed: true, merged: true, prNumber, settingsPreserved }
+    }
+    // mergeable 超时仍未知（GitHub 计算慢/受保护分支）：不能当冲突——否则会自动
+    // 触发 AI 冲突处理。标记 pending，保留 PR，等下一轮或人工处理。
+    if (isGithub && !mergeable && !conflict) {
+      return { pushed: true, prPending: true, prNumber, settingsPreserved }
     }
     // conflict → leave PR open; client shows the "AI 解决冲突" action button
     return { pushed: true, prConflict: true, prNumber, conflict: true, settingsPreserved }
