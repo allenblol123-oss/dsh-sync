@@ -1292,7 +1292,7 @@ function SettingsSlotComponent(props) {
 
 // ── Plugin plane contract ────────────────────────────────────────────────
 
-const CLIENT_NAME = '@weibaohui/dsh-sync'
+const CLIENT_NAME = '@allenblol123-oss/dsh-sync'
 
 module.exports = {
   name: CLIENT_NAME,

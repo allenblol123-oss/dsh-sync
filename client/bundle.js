@@ -2,7 +2,7 @@
  * Regenerate with: npm run build:client
  */
 window.__ModuleLoader__.load({
-  id: "@weibaohui/dsh-sync",
+  id: "@allenblol123-oss/dsh-sync",
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -1302,7 +1302,7 @@ window.__ModuleLoader__.load({
 
     // ── Plugin plane contract ────────────────────────────────────────────────
 
-    const CLIENT_NAME = '@weibaohui/dsh-sync'
+    const CLIENT_NAME = '@allenblol123-oss/dsh-sync'
 
     module.exports = {
       name: CLIENT_NAME,
