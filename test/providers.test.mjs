@@ -149,3 +149,45 @@ test('prChannelFor: GitHub 走 PR 通道，GitCode 保持原通道，其他主�
   assert.equal(I.prChannelFor('https://git.internal.corp/team/repo.git'), null, '自建主机仍只推分支')
   assert.equal(I.prChannelFor(''), null)
 })
+
+// ── fork 增强：session 日志（.jsonl.zstd）无损自动合并 ──
+
+const zlib = require('node:zlib')
+const frameLine = (line) => zlib.zstdCompressSync(Buffer.from(line + '\n', 'utf8'))
+const frameLines = (lines) => Buffer.concat(lines.map(frameLine))
+const readMerged = (buf) => I.decompressZstdFrames(buf).toString('utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+
+test('mergeSessionZstdBuffers: 按 seq 取并集、去重、排序（一边只是多追加）', () => {
+  const session = JSON.stringify({ type: 'session', version: 4, id: 's1', createdAt: 1 })
+  const ev = (seq, time, type) => JSON.stringify({ type, seq, time, data: {} })
+  const ours = frameLines([session, ev(0, 100, 'user/message'), ev(1, 200, 'assistant/message')])
+  const theirs = frameLines([session, ev(0, 100, 'user/message'), ev(1, 200, 'assistant/message'), ev(2, 300, 'tool/call')])
+  const merged = readMerged(I.mergeSessionZstdBuffers(ours, theirs))
+  assert.equal(merged.length, 4, '并集不重复')
+  assert.deepEqual(merged.map((x) => x.seq ?? 'session'), ['session', 0, 1, 2], '按 seq 排序、session 行在前')
+  // 幂等：把合并结果再并一次不应增长
+  assert.equal(readMerged(I.mergeSessionZstdBuffers(I.mergeSessionZstdBuffers(ours, theirs), theirs)).length, 4)
+})
+
+test('mergeSessionZstdBuffers: 同 seq 内容不同取 time 较新的一行', () => {
+  const a = frameLines([JSON.stringify({ type: 'user/message', seq: 0, time: 100, data: { v: 'old' } })])
+  const b = frameLines([JSON.stringify({ type: 'user/message', seq: 0, time: 200, data: { v: 'new' } })])
+  const merged = readMerged(I.mergeSessionZstdBuffers(a, b))
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0].data.v, 'new')
+})
+
+test('mergeSessionZstdBuffers: 任一边不是合法 zstd 时保留另一边，不制造坏文件', () => {
+  const good = frameLines([JSON.stringify({ type: 'session', version: 4 })])
+  const bad = Buffer.from('not a zstd file')
+  assert.deepEqual(I.mergeSessionZstdBuffers(bad, good), good)
+  assert.deepEqual(I.mergeSessionZstdBuffers(good, bad), good)
+})
+
+test('isSessionLogPath: 只匹配 session 日志，普通文本/其他二进制不碰', () => {
+  assert.equal(I.isSessionLogPath('sessions/--x--/session-a/session.v4.jsonl.zstd'), true)
+  assert.equal(I.isSessionLogPath('settings/settings.yaml'), false)
+  assert.equal(I.isSessionLogPath('skills/dsh/foo/SKILL.md'), false)
+  assert.equal(I.isSessionLogPath('plugins/desktop/package.json'), false)
+  assert.equal(I.isSessionLogPath(''), false)
+})

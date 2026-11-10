@@ -1864,11 +1864,111 @@ function substituteParams(template, params) {
 //    process. The agent only resolves conflicts in the prepared tree, so the
 //    token never enters the prompt/model context. ──
 
+// ── Session 日志（.jsonl.zstd）无损自动合并 ────────────────────────────
+// DSH session v4 日志 = 多帧 zstd 拼接的 append-only JSONL：每帧独立压缩，
+// 每行是带 seq 的 JSON 事件。git 把它当二进制（无法 union merge），但按帧
+// 解压 → 逐行按 seq 取并集 → 逐行重新分帧压缩，可得到与原生写法定一致的文件。
+// 冲突时先用它自动解决会话文件；剩下的文本文件（settings/技能/插件清单）才交给 AI。
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
+
+function zstdFrameOffsets(buf) {
+  const offs = []
+  for (let i = 0; i <= buf.length - 4; i++) {
+    if (buf[i] === ZSTD_MAGIC[0] && buf[i + 1] === ZSTD_MAGIC[1] && buf[i + 2] === ZSTD_MAGIC[2] && buf[i + 3] === ZSTD_MAGIC[3]) offs.push(i)
+  }
+  return offs
+}
+
+function decompressZstdFrames(buf) {
+  const zlib = require('node:zlib')
+  const offs = zstdFrameOffsets(buf)
+  const chunks = []
+  for (let k = 0; k < offs.length; k++) {
+    const start = offs[k]
+    const end = k + 1 < offs.length ? offs[k + 1] : buf.length
+    if (end <= start) continue
+    try { chunks.push(zlib.zstdDecompressSync(buf.subarray(start, end))) } catch { /* 跳过坏帧 */ }
+  }
+  return Buffer.concat(chunks)
+}
+
+function compressJsonlToZstdFrames(text) {
+  const zlib = require('node:zlib')
+  const lines = String(text || '').split('\n').filter((l) => l.trim() !== '')
+  return Buffer.concat(lines.map((l) => zlib.zstdCompressSync(Buffer.from(l + '\n', 'utf8'))))
+}
+
+function isSessionLogPath(p) {
+  return /\.jsonl\.zstd$/i.test(String(p || ''))
+}
+
+/** 合并两份 session 日志：正常情况两边共享前缀、一边只多追加事件 → 按 seq 取并集；
+ *  同 seq 内容不同（真并发写）取 time 较新的一行，等时保留本机版。
+ *  任一边解不出 JSONL（格式异常）时退化为"保留本机"，不制造坏文件。 */
+function mergeSessionZstdBuffers(ours, theirs) {
+  const read = (buf) => {
+    const text = decompressZstdFrames(buf).toString('utf8')
+    const out = []
+    for (const raw of text.split('\n')) {
+      const line = raw.trim()
+      if (!line) continue
+      let obj = null
+      try { obj = JSON.parse(line) } catch { obj = null }
+      out.push({ line, obj })
+    }
+    return out
+  }
+  const a = read(ours), b = read(theirs)
+  if (a.length === 0 || b.length === 0) return a.length > 0 ? ours : (b.length > 0 ? theirs : ours)
+  const bySeq = new Map()
+  const noSeq = []
+  const put = (rec) => {
+    const seq = rec.obj && typeof rec.obj.seq === 'number' ? rec.obj.seq : null
+    if (seq === null) { if (!noSeq.some((x) => x.line === rec.line)) noSeq.push(rec); return }
+    const prev = bySeq.get(seq)
+    if (!prev) { bySeq.set(seq, rec); return }
+    const pt = typeof prev.obj.time === 'number' ? prev.obj.time : 0
+    const ct = typeof rec.obj.time === 'number' ? rec.obj.time : 0
+    if (ct > pt) bySeq.set(seq, rec)
+  }
+  a.forEach(put)
+  b.forEach(put)
+  const seqLines = [...bySeq.entries()].sort((x, y) => x[0] - y[0]).map((e) => e[1].line)
+  return compressJsonlToZstdFrames([...noSeq.map((r) => r.line), ...seqLines].join('\n'))
+}
+
+async function gitShowStageBuf(binary, repoDir, stage, path) {
+  return await new Promise((resolve, reject) => {
+    execFile(binary, ['show', `:${stage}:${path}`], { cwd: repoDir, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }, (error, stdout) => error ? reject(error) : resolve(stdout))
+  })
+}
+
+/** 把冲突文件里能自动无损合并的 session 日志先解掉并 git add。
+ *  返回 { resolved, failed }；failed 的留给 AI/人工。 */
+async function resolveSessionLogConflicts(binary, repoDir, conflicts) {
+  const resolved = [], failed = []
+  for (const p of conflicts) {
+    if (!isSessionLogPath(p)) continue
+    try {
+      const ours = await gitShowStageBuf(binary, repoDir, 2, p)
+      const theirs = await gitShowStageBuf(binary, repoDir, 3, p)
+      if (!ours || !ours.length || !theirs || !theirs.length) throw new Error('缺 ours/theirs 版本')
+      const merged = mergeSessionZstdBuffers(ours, theirs)
+      await fsP.writeFile(join(repoDir, p), merged)
+      await gitExec(binary, ['add', '--', p], repoDir)
+      resolved.push(p)
+    } catch (e) {
+      failed.push({ path: p, error: String((e && e.message) || e) })
+    }
+  }
+  return { resolved, failed }
+}
+
 /** Fetch the sync branch + canonical branch, checkout the branch tip and
  *  merge the canonical branch into it — leaving a conflicted working tree
- *  for the agent. Returns { autoMerged, conflicts }: autoMerged=true means
- *  the merge went through cleanly (PR should be mergeable now — skip the
- *  agent and go straight to finalize). */
+ *  for the agent. Session logs that can be merged losslessly are resolved
+ *  first (see mergeSessionZstdBuffers); the rest goes to the agent.
+ *  Returns { autoMerged, conflicts, autoResolved, autoResolveFailed }. */
 async function prepareConflictTree(binary, eff, { repoDir, branch }) {
   const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
   await gitExec(binary, ['fetch', remote, branch], repoDir, authEnv)
@@ -1878,15 +1978,28 @@ async function prepareConflictTree(binary, eff, { repoDir, branch }) {
   let merged = false
   // merge 可能创建自动合并提交：身份显式内联，不依赖机器的全局 git 配置
   try { await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'merge', '--no-edit', 'FETCH_HEAD'], repoDir); merged = true } catch { /* conflicts left in the tree */ }
-  const raw = await gitExec(binary, ['diff', '--name-only', '--diff-filter=U'], repoDir).catch(() => '')
-  const conflicts = String(raw || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-  return { autoMerged: merged && conflicts.length === 0, conflicts }
+  const listConflicts = async () => {
+    const raw = await gitExec(binary, ['diff', '--name-only', '--diff-filter=U'], repoDir).catch(() => '')
+    return String(raw || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+  }
+  let conflicts = await listConflicts()
+  // 第一步：会话日志是确定性的无损合并，先解掉，不进 AI
+  const sessionRes = conflicts.length ? await resolveSessionLogConflicts(binary, repoDir, conflicts) : { resolved: [], failed: [] }
+  conflicts = await listConflicts()
+  if (!merged && conflicts.length === 0) {
+    // 冲突已全部由会话日志自动合并消化：补上 merge 提交
+    try { await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '--no-edit'], repoDir); merged = true } catch {
+      try { await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', 'dsh-sync auto merge session logs'], repoDir); merged = true } catch {}
+    }
+    conflicts = await listConflicts()
+  }
+  return { autoMerged: merged && conflicts.length === 0, conflicts, autoResolved: sessionRes.resolved, autoResolveFailed: sessionRes.failed }
 }
 
 /** Push the resolved branch, wait for the PR to report mergeable, squash-merge
  *  it, delete the remote sync branch and advance the shadow baseline onto the
- *  canonical branch. Non-GitCode remotes (local test bare repos): push only —
- *  the PR REST surface doesn't exist there. */
+ *  canonical branch. Works for GitCode and GitHub (prChannelFor); unsupported
+ *  hosts (self-hosted/local bare repos) push only — no PR REST surface there. */
 async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, state, logger, pollTries = 5, pollGapMs = 3000 }) {
   const log = (m) => { if (logger && logger.warn) logger.warn(m) }
   const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
@@ -1897,15 +2010,18 @@ async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, 
   const cur = (await gitExec(binary, ['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).catch(() => '')).trim()
   if (cur !== branch) return { merged: false, reason: `影子仓库当前在 ${cur || 'detached HEAD'}，不在分支 ${branch}（可能被并发同步重置）——请重新发起冲突处理` }
   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
-  const parsed = parseRepoUrl(eff.repoUrl)
-  if (!parsed) return { merged: true, prSkipped: true }
-  // mergeable 是异步计算的：推送前 PR 一直挂着 mergeable=false，GitCode 在 push 后
-  // 才重算——所以每拍先等再查，false 不一票否决，连续到最后仍 false 才判失败
+  const channel = prChannelFor(eff.repoUrl)
+  if (!channel) return { merged: true, prSkipped: true }
+  const isGithub = channel.kind === 'github'
+  // mergeable 是异步计算的：推送前 PR 一直挂着 mergeable=false，push 后才重算——
+  // 所以每拍先等再查，false 不一票否决，连续到最后仍 false 才判失败
   let mergeable = false, lastState
   for (let i = 0; i < pollTries; i++) {
     await new Promise(r => setTimeout(r, pollGapMs))
     try {
-      const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+      const det = isGithub
+        ? await githubGetPullRequest(eff.token, channel.owner, channel.repo, prNumber)
+        : await getPullRequest(eff.token, channel.owner, channel.repo, prNumber)
       if (det.ok && det.json) {
         lastState = det.json.mergeable
         if (det.json.mergeable === true) { mergeable = true; break }
@@ -1913,7 +2029,9 @@ async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, 
     } catch (e) { log(`dsh-sync: PR 轮询失败：${e && e.message}`) }
   }
   if (!mergeable) return { merged: false, reason: lastState === false ? 'PR 仍报 mergeable=false（冲突可能未全部解决）' : 'PR mergeable 状态超时未就绪' }
-  const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+  const mr = isGithub
+    ? await githubMergePullRequest(eff.token, channel.owner, channel.repo, prNumber, 'squash')
+    : await mergePullRequest(eff.token, channel.owner, channel.repo, prNumber, 'squash')
   if (!mr.ok) return { merged: false, reason: `合并 PR 失败（HTTP ${mr.status}）` }
   // 合并即删远端 sync 分支 + 影子基线推进到 main（与 runPush 合并路径一致）
   await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
@@ -2187,7 +2305,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config: Config ?? undefined,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, prChannelFor, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, githubRequest, githubCreatePullRequest, githubGetPullRequest, githubMergePullRequest, githubWaitMergeable, GITHUB_API_BASE, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, prChannelFor, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, githubRequest, githubCreatePullRequest, githubGetPullRequest, githubMergePullRequest, githubWaitMergeable, GITHUB_API_BASE, mergeSessionZstdBuffers, decompressZstdFrames, compressJsonlToZstdFrames, isSessionLogPath, resolveSessionLogConflicts, gitShowStageBuf, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
@@ -2405,6 +2523,11 @@ module.exports = {
     const ALIGN_COOLDOWN_MS = 30 * 60 * 1000
     const AUTO_ALIGN_MAX_FILES = 50
     const alignState = { active: false, lastSig: '', lastAt: 0 }
+    // 冲突自动处理：同一个冲突 PR 只自动跑一次；另有 30 分钟冷却，防止每轮
+    // autoSync 都"推新分支 → 新 PR → 再跑一次 AI"造成 token 消耗。
+    const CONFLICT_COOLDOWN_MS = 30 * 60 * 1000
+    const conflictAutoTried = new Set()
+    const conflictAutoState = { active: false, lastAt: 0 }
     const runSync = async ({ autoAlign = true, forceBackup = false } = {}) => {
       if (syncRun !== null) return syncRun
       syncRun = (async () => {
@@ -2418,6 +2541,7 @@ module.exports = {
         if (release === null) throw new Error('另一个同步进程正在运行（已跳过）')
         const started = Date.now()
         let result = { pushed: false, pulled: false }
+        let autoConflictRequest = null
         try {
           if (gitOn) {
             // 影子仓库先行（首次运行在这里 clone）：reconcile 需要它来 fetch/回填
@@ -2457,6 +2581,20 @@ module.exports = {
                 if (startedJob) result.align = { jobId: startedJob.id, bothModified: both.map(f => f.shadowPath) }
               }
             }
+            // 冲突 PR：conflictMode=ai 时自动触发一次冲突处理（会话日志先无损
+            // 自动合并，剩余文本冲突交给 agent）。同一 PR 只跑一次 + 30 分钟冷却。
+            const pushRes = result.push
+            if (autoAlign && eff.conflictMode === 'ai' && pushRes && pushRes.prConflict) {
+              const kind = detectRepoProvider(eff.repoUrl).kind
+              const pr = pushRes.prNumber || state.lastPrNumber
+              const br = pushRes.branch || state.lastPushedBranch
+              if ((kind === 'gitcode' || kind === 'github') && pr && br && !conflictAutoState.active
+                && Date.now() - conflictAutoState.lastAt > CONFLICT_COOLDOWN_MS
+                && !conflictAutoTried.has(String(pr))) {
+                conflictAutoState.lastAt = Date.now()
+                autoConflictRequest = { eff, branch: br, prNumber: pr }
+              }
+            }
           }
           state.lastSyncAt = new Date().toISOString()
           // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）。
@@ -2480,6 +2618,16 @@ module.exports = {
           state.lastResult = { ...result, at: state.lastSyncAt, durationMs: Date.now() - started }
           await saveState()
         } finally { release() }
+        if (autoConflictRequest && !conflictAutoTried.has(String(autoConflictRequest.prNumber))) {
+          conflictAutoTried.add(String(autoConflictRequest.prNumber))
+          const req = autoConflictRequest
+          // 延迟到锁释放后：startConflictJob 自己会持锁准备冲突树
+          setTimeout(() => {
+            startConflictJob(req.eff, { branch: req.branch, prNumber: req.prNumber })
+              .then(started => { if (started) ctx.logger.warn(`dsh-sync: auto conflict job ${started.job.id} (PR #${req.prNumber}, autoMerged=${!!started.autoMerged})`) })
+              .catch(e => ctx.logger.warn(`dsh-sync: auto conflict: ${e && e.message}`))
+          }, 2000)
+        }
         return result
       })().finally(() => { syncRun = null })
       return syncRun
@@ -2551,6 +2699,57 @@ module.exports = {
         },
       })
       return job
+    }
+
+    // 冲突处理 job（手动按钮 /conflict/run 与 runSync 自动触发共用）：
+    // 持锁准备冲突树（会话日志先无损自动合并）→ 剩余文本冲突交给 agent 语义
+    // 合并 → 持锁 finalize（push + 轮询 mergeable + squash 合并 + 清分支）。
+    // 凭据全程留在 host，prompt 不含 token。GitCode / GitHub 均可用。
+    const startConflictJob = async (eff, { branch, prNumber }) => {
+      if (conflictAutoState.active) return null
+      if (!branch || !prNumber) return null
+      const release = await acquireLock(lockFile)
+      if (release === null) return null
+      let prep
+      try { prep = await prepareConflictTree(eff.gitBinary, eff, { repoDir, branch }) }
+      catch (e) { release(); throw e }
+      release()
+      conflictAutoState.active = true
+      const finalizeJob = async (job) => {
+        const post = async (n) => {
+          const release2 = await acquireLock(lockFile)
+          if (release2 === null) {
+            if (n < 4) return setTimeout(() => post(n + 1), 5000)
+            job.status = 'error'; job.code = 1; job.output += '\n[finalize 失败] 同步锁被占，稍后可重试\n'; conflictAutoState.active = false; return
+          }
+          try {
+            const r = await finalizeConflictBranch(eff.gitBinary, eff, { repoDir, branch, prNumber, state, logger: ctx.logger })
+            if (r.merged) job.output += r.prSkipped ? '\n已推送分支（本地远端，无 PR 可合并）\n' : `\nPR #${prNumber} 已合并，分支已清理\n`
+            else { job.status = 'error'; job.code = 1; job.output += '\n[finalize 失败] ' + r.reason + '\n' }
+          } catch (e) {
+            job.status = 'error'; job.code = 1
+            job.output += '\n[finalize 异常] ' + String((e && e.message) || e) + '\n'
+          } finally { release2(); conflictAutoState.active = false }
+        }
+        post(0)
+      }
+      if (prep.autoMerged) {
+        // 冲突已自动消化（merge 干净，或会话日志已无损合并）：无需 agent，直接收尾
+        const job = { id: 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), status: 'running', startedAt: new Date().toISOString(), dir: repoDir, output: '冲突已自动合并（会话日志无损合并 / merge 干净通过），直接推送并合并 PR…\n', code: null }
+        conflictRunJobs.set(job.id, job)
+        finalizeJob(job)
+        return { job, autoMerged: true, conflicts: [], autoResolved: prep.autoResolved || [] }
+      }
+      const prompt = substituteParams(CONFLICT_PROMPT_ZH, { repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber })
+      const job = createAgentRunJob({
+        prompt, dir: homedir(), jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc,
+        onFinish: () => {
+          if (job.code !== 0) { job.output += '\n[agent 未正常完成，保留冲突 PR 待人工处理]\n'; conflictAutoState.active = false; return }
+          finalizeJob(job)
+        },
+      })
+      if (prep.autoResolved && prep.autoResolved.length) job.output += `会话日志已无损自动合并 ${prep.autoResolved.length} 个\n`
+      return { job, autoMerged: false, conflicts: prep.conflicts, autoResolved: prep.autoResolved || [] }
     }
 
     // 远端对齐 job（浏览远端 → 预览 → AI 对齐）：把其他机器备份中的选中文件
@@ -2873,61 +3072,19 @@ module.exports = {
             if (eff.conflictMode !== 'ai') { sendJson(res, 403, { error: 'conflictMode 为 manual，AI 冲突处理已关闭（设置页改为「ai」后可用）' }); return }
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
             const conflictProvider = detectRepoProvider(eff.repoUrl)
-            if (conflictProvider.kind !== 'gitcode') {
-              sendJson(res, 400, { error: 'AI 冲突处理依赖 PR 流程，目前仅在 GitCode 仓库上可用（当前主机 ' + (conflictProvider.host || '未知') + '）：换用 GitCode 私有仓库，或手动解决分支冲突' })
+            if (conflictProvider.kind !== 'gitcode' && conflictProvider.kind !== 'github') {
+              sendJson(res, 400, { error: 'AI 冲突处理依赖 PR 流程，目前支持 GitCode / GitHub（当前主机 ' + (conflictProvider.host || '未知') + '）：换用 GitCode/GitHub 私有仓库，或手动解决分支冲突' })
               return
             }
             const body = await readJsonBody(req)
             const branch = body.branch || state.lastPushedBranch
             const prNumber = body.prNumber || state.lastPrNumber
             if (!branch || !prNumber) { sendJson(res, 400, { error: '没有待解决的冲突 PR' }); return }
-            // prepare 动影子仓库，与自动同步互斥：持锁做，做完释放再放 agent
-            const release = await acquireLock(lockFile)
-            if (release === null) { sendJson(res, 409, { error: '另一个同步进程正在运行，稍后再试' }); return }
-            let prep
-            try { prep = await prepareConflictTree(eff.gitBinary, eff, { repoDir, branch }) }
-            catch (e) { release(); sendJson(res, 400, { error: '准备冲突工作树失败：' + String(e && e.message || e) }); return }
-            release()
-            // finalize 收尾（两条路径共用）：push + 轮询 mergeable + squash 合并。
-            // 持锁（带重试）：影子仓库推进与自动同步互斥。
-            const finalizeJob = async (job, eff2, branch2, prNumber2) => {
-              const post = async (n) => {
-                const release2 = await acquireLock(lockFile)
-                if (release2 === null) {
-                  if (n < 4) return setTimeout(() => post(n + 1), 5000)
-                  job.status = 'error'; job.code = 1; job.output += '\n[finalize 失败] 同步锁被占，稍后可重试\n'; return
-                }
-                try {
-                  const r = await finalizeConflictBranch(eff2.gitBinary, eff2, { repoDir, branch: branch2, prNumber: prNumber2, state, logger: ctx.logger })
-                  if (r.merged) job.output += r.prSkipped ? '\n已推送分支（本地远端，无 PR 可合并）\n' : `\nPR #${prNumber2} 已合并，分支已清理\n`
-                  else { job.status = 'error'; job.code = 1; job.output += '\n[finalize 失败] ' + r.reason + '\n' }
-                } catch (e) {
-                  job.status = 'error'; job.code = 1
-                  job.output += '\n[finalize 异常] ' + String(e && e.message || e) + '\n'
-                } finally { release2() }
-              }
-              post(0)
-            }
-            if (prep.autoMerged) {
-              // merge 干净通过：PR 应已可合并，无需 agent，直接走 host finalize
-              const job = { id: 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), status: 'running', startedAt: new Date().toISOString(), dir: repoDir, output: '合并无冲突，直接推送并合并 PR…\n', code: null }
-              conflictRunJobs.set(job.id, job)
-              finalizeJob(job, eff, branch, prNumber)
-              sendJson(res, 202, { jobId: job.id, status: job.status, autoMerged: true })
-              return
-            }
-            const prompt = substituteParams(CONFLICT_PROMPT_ZH, {
-              repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber,
-            })
-            const job = createAgentRunJob({
-              prompt, dir: homedir(), jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc,
-              onFinish: () => {
-                // agent 提交后由 host 收尾：push、轮询 mergeable、squash 合并、清分支
-                if (job.code !== 0) { job.output += '\n[agent 未正常完成，保留冲突 PR 待人工处理]\n'; return }
-                finalizeJob(job, eff, branch, prNumber)
-              },
-            })
-            sendJson(res, 202, { jobId: job.id, status: job.status, conflicts: prep.conflicts })
+            let started
+            try { started = await startConflictJob(eff, { branch, prNumber }) }
+            catch (e) { sendJson(res, 400, { error: '准备冲突工作树失败：' + String((e && e.message) || e) }); return }
+            if (!started) { sendJson(res, 409, { error: '另一个同步/冲突处理任务正在运行，稍后再试' }); return }
+            sendJson(res, 202, { jobId: started.job.id, status: started.job.status, autoMerged: !!started.autoMerged, conflicts: started.conflicts || [], autoResolved: started.autoResolved || [] })
             return
           }
 

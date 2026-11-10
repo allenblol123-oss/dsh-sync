@@ -145,22 +145,25 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
   > 如果是公开仓库，上传后有密钥泄露危险：同步的 settings 组会整文件上传本机 `~/.dsh/settings.yaml`（可能含其它插件的明文密钥）。请确认该仓库是私有仓库、并接受此风险后再继续。
 
   确认后本次保存才放行（`allowUnverifiedRepo` 标记不落盘，每次保存都要重新确认）。**请务必确认仓库为私有。**
-- **非 GitCode 的功能差异**：GitLab / Gitee / 自建主机走「只推分支」的降级路径（`prSkipped`）；**GitHub 自本 fork（0.4.11-github.1）起支持 PR 自动创建 + squash 合并 + 合并后删除分支**。「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 仍为 GitCode 专属，这些入口对其他托管方会返回明确错误而不是静默失败。
+- **非 GitCode 的功能差异**：GitLab / Gitee / 自建主机走「只推分支」的降级路径（`prSkipped`）；**GitHub 自本 fork 起支持 PR 自动创建 + squash 合并 + 合并后删除分支，并支持 AI 冲突处理**（会话日志先自动无损合并，剩余文本冲突交 AI）。「清理遗留分支」(`prune-branches`) 仍为 GitCode 专属，对其他托管方会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
-## 更新日志（0.4.3 → 0.4.10）
+## 更新日志（fork 0.4.12）
 
-### 0.4.11-github.1（fork）—— GitHub 自动 PR + 合并 + 删分支
+### 0.4.12（fork）—— GitHub 自动 PR/合并/删分支 + GitHub AI 冲突处理 + 会话日志无损合并
 
 上游此前只有 GitCode 实现了「推送分支 → 创建 PR → 合并 → 删分支」；GitHub/GitLab/Gitee 走 `prSkipped` 只推分支，导致 `main` 永不推进、每次同步遗留一个 `sync/*` 分支、多机拉取拿不到新数据。
 
-本次 fork 改动（仅 GitHub，GitCode 逻辑未动）：
+本 fork 改动（GitCode 原有逻辑未动）：
 
-1. 新增 GitHub PR 适配层：`githubCreatePullRequest` / `githubGetPullRequest` / `githubMergePullRequest`（`Authorization: Bearer` + `api.github.com`，端点与 GitCode 结构一致）；
-2. `runPush` 与 `promoteSnapshotToCloud` 改用 `detectRepoProvider` 选择 PR 通道：GitHub 走新适配层，GitCode 保持原逻辑，其他主机仍降级；
-3. GitHub 的 `mergeable` 是异步计算的（首查常为 `null`），新增 `githubWaitMergeable` 轮询（6 × 800ms），避免把可合并 PR 误判为冲突；
-4. 合并成功后复用通用的 `git push <remote> --delete <branch>` 删除远端 sync 分支；
-5. 测试：`test/providers.test.mjs` 新增 GitHub 创建/查询/合并与 mergeable 轮询用例（mock fetch，离线可跑）。
+1. GitHub PR 适配层：`githubCreatePullRequest` / `githubGetPullRequest` / `githubMergePullRequest`（`Authorization: Bearer` + `api.github.com`）；
+2. `prChannelFor(repoUrl)` 统一选择 PR 通道：GitHub → 新适配层，GitCode → 原实现，自建/未知主机 → 只推分支；
+3. `runPush` / `promoteSnapshotToCloud` 接入该通道；GitHub 对重复 PR 的 422 按「已有进行中的同步 PR」处理；
+4. `mergeable` 是异步计算的 → `githubWaitMergeable` 轮询，避免把可合并 PR 误判为冲突；
+5. 合并成功后复用 `git push <remote> --delete <branch>` 清远端 sync 分支；
+6. **AI 冲突处理支持 GitHub**：`conflict/run` 与 `finalizeConflictBranch` 改为 provider-aware（GitCode/GitHub）；`conflictMode=ai` 时同步检测到冲突 PR 会自动触发一次处理（同一 PR 只跑一次 + 30 分钟冷却，避免每轮烧模型调用）；
+7. **会话日志 `.jsonl.zstd` 无损自动合并**：冲突时先逐帧解压 → 按 `seq` 取并集（同 seq 取 `time` 较新的一行）→ 逐行重新分帧压缩；会话文件不进 AI、不丢事件，剩余文本冲突（settings/技能/插件清单）才交给 agent；
+8. 测试：`test/providers.test.mjs` 新增 GitHub PR、mergeable 轮询、通道选择、zstd 合并等 5 组用例；全量 94 项离线测试通过；真实私有仓库跑通「推送 → PR → mergeable → squash 合并 → 删分支」。
 
 ## 更新日志（0.4.3 → 0.4.10）
 
